@@ -11,7 +11,7 @@ import time
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import BotCommand, LinkPreviewOptions, Message
 
@@ -39,26 +39,52 @@ def is_admin(user_id: int | None) -> bool:
     return user_id is not None and user_id in settings.admin_ids
 
 
-# ---------- отправка в канал ----------
+# ---------- отправка ----------
 
-async def send_alert(sig: Signal) -> bool:
-    text = format_signal(sig, settings.platform)
-    async with _send_lock:
-        for attempt in range(3):
+def recipients() -> list[int]:
+    """Все, кто нажал /start, плюс канал из CHANNEL_ID, если задан."""
+    chats = store.subscribers()
+    if settings.channel_id and settings.channel_id not in chats:
+        chats.append(settings.channel_id)
+    return chats
+
+
+async def send_to(chat_id: int, sig: Signal, text: str) -> bool:
+    for attempt in range(3):
+        try:
             try:
-                try:
-                    await bot.send_photo(settings.channel_id, photo=sig.player.headshot_url, caption=text)
-                except TelegramBadRequest as e:  # картинка недоступна/слишком длинный caption — шлём текстом
-                    log.warning("send_photo не удался (%s), шлю текстом", e)
-                    await bot.send_message(settings.channel_id, text, link_preview_options=LinkPreviewOptions(is_disabled=True))
-                await asyncio.sleep(3)  # лимит Telegram на посты в канал
-                return True
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after + 1)
-            except Exception:
-                log.exception("Не удалось отправить сигнал по %s", sig.player.title)
-                return False
+                await bot.send_photo(chat_id, photo=sig.player.headshot_url, caption=text)
+            except TelegramBadRequest as e:  # картинка недоступна/слишком длинный caption — шлём текстом
+                log.warning("send_photo в %s не удался (%s), шлю текстом", chat_id, e)
+                await bot.send_message(chat_id, text, link_preview_options=LinkPreviewOptions(is_disabled=True))
+            return True
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramForbiddenError:  # пользователь заблокировал бота — убираем из подписчиков
+            if store.unsubscribe(chat_id):
+                log.info("Подписчик %s заблокировал бота, удалён", chat_id)
+            return False
+        except Exception:
+            log.exception("Не удалось отправить сигнал по %s в %s", sig.player.title, chat_id)
+            return False
     return False
+
+
+async def send_alert(sig: Signal, only_to: int | None = None) -> int:
+    """Рассылает сигнал подписчикам (или одному чату). Возвращает число успешных отправок."""
+    text = format_signal(sig, settings.platform)
+    chats = [only_to] if only_to else recipients()
+    if not chats:
+        log.warning("Некому слать: нет подписчиков (нужно написать боту /start) и CHANNEL_ID пуст")
+        return 0
+    sent = 0
+    async with _send_lock:
+        for chat_id in chats:
+            if await send_to(chat_id, sig, text):
+                sent += 1
+            if len(chats) > 1:
+                await asyncio.sleep(0.5)  # лимит Telegram ~30 сообщений/сек
+    return sent
 
 
 # ---------- опрос ----------
@@ -98,7 +124,7 @@ async def check_player(player: PlayerInfo) -> None:
     if not detector.should_alert(sig):
         return
     log.info("СИГНАЛ %s: %s vs рынок %s, профит %s (-%.1f%%)", player.title, sig.price, sig.market, sig.profit, sig.drop_percent)
-    if await send_alert(sig):
+    if await send_alert(sig) > 0:
         store.record_alert(player.id, sig.price, sig.market)
         _stats["alerts"] += 1
 
@@ -158,11 +184,27 @@ async def watchlist_loop() -> None:
 # ---------- команды ----------
 
 @router.message(CommandStart())
+async def cmd_start(message: Message) -> None:
+    new = store.subscribe(message.chat.id)
+    await message.answer(
+        ("✅ Подписал. " if new else "Ты уже подписан. ")
+        + f"Буду присылать сюда карты, чья цена резко упала ниже рыночной (платформа <b>{settings.platform.upper()}</b>). "
+        "Отписаться — /stop, справка — /help"
+    )
+
+
+@router.message(Command("stop"))
+async def cmd_stop(message: Message) -> None:
+    await message.answer("Отписал. Вернуться — /start" if store.unsubscribe(message.chat.id) else "Ты и не был подписан. Подписаться — /start")
+
+
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     text = (
-        "Слежу за рынком EA FC (FUTNext, платформа <b>{plat}</b>) и постю в канал карты, "
+        "Слежу за рынком EA FC (FUTNext, платформа <b>{plat}</b>) и присылаю карты, "
         "чья текущая цена ниже рыночной на {drop:g}%+ с профитом от {profit} после налога.\n\n"
+        "/start — подписаться на сигналы\n"
+        "/stop — отписаться\n"
         "/price &lt;имя&gt; — текущая цена карты из watchlist\n"
         "/id — chat_id и user_id\n"
     ).format(plat=settings.platform.upper(), drop=settings.drop_percent, profit=coins(settings.min_profit))
@@ -173,7 +215,7 @@ async def cmd_help(message: Message) -> None:
             "/refresh — пересобрать watchlist\n"
             "/watch &lt;id&gt; — добавить карту вручную (id из ссылки futnext.com/players/...)\n"
             "/unwatch &lt;id&gt; — убрать\n"
-            "/test &lt;id&gt; — отправить пример поста в канал\n"
+            "/test &lt;id&gt; — прислать пример поста сюда\n"
         )
     await message.answer(text)
 
@@ -195,6 +237,7 @@ async def cmd_status(message: Message) -> None:
         f"Кругов опроса: {_stats['cycles']}, последний: {_stats['checked']} карт за {_stats['cycle_seconds']:.0f} с, "
         f"ошибок {_stats['errors']}, сигналов {_stats['signals']}\n"
         f"Постов за 24ч: {store.alerts_since(24)}\n"
+        f"Подписчиков: {len(store.subscribers())}" + (f", канал {settings.channel_id}" if settings.channel_id else "") + "\n"
         f"Условия: просадка ≥{settings.drop_percent:g}% к рынку и ≥{settings.fresh_percent:g}% за час, профит ≥{coins(settings.min_profit)}, "
         f"cooldown {settings.alert_cooldown_minutes} мин, опрос каждые {settings.poll_seconds} с"
     )
@@ -307,8 +350,8 @@ async def cmd_test(message: Message) -> None:
         age_minutes=live.age_minutes if live else 0, hour_avg=detector.hour_average(points),
         single_lot=False, history=points[-6:], snapshots=store.last_prices(p.id, 10),
     )
-    ok = await send_alert(sig)
-    await message.answer("Отправил пример в канал" if ok else "Не получилось отправить — проверь CHANNEL_ID и права бота в канале")
+    if not await send_alert(sig, only_to=message.chat.id):
+        await message.answer("Не получилось отправить пример — смотри логи")
 
 
 # ---------- запуск ----------
@@ -331,11 +374,13 @@ async def main() -> None:
         detector = Detector(settings, store, client)
         me = await bot.get_me()
         await bot.set_my_commands([
+            BotCommand(command="start", description="Подписаться на сигналы"),
+            BotCommand(command="stop", description="Отписаться"),
             BotCommand(command="price", description="Текущая цена карты"),
             BotCommand(command="status", description="Состояние бота (админ)"),
             BotCommand(command="help", description="Справка"),
         ])
-        log.info("Бот @%s запущен, платформа %s, канал %s", me.username, settings.platform, settings.channel_id)
+        log.info("Бот @%s запущен, платформа %s, подписчиков %d, канал %s", me.username, settings.platform, len(store.subscribers()), settings.channel_id or "-")
         tasks = [asyncio.create_task(watchlist_loop()), asyncio.create_task(poll_loop())]
         try:
             await dp.start_polling(bot, allowed_updates=["message"])

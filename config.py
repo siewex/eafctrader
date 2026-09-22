@@ -64,8 +64,6 @@ class Settings:
         problems = []
         if not self.bot_token:
             problems.append("BOT_TOKEN не задан")
-        if not self.channel_id:
-            problems.append("CHANNEL_ID не задан (куда постить сигналы)")
         if self.platform not in {"pc", "ps"}:
             problems.append("FUT_PLATFORM должен быть pc или ps")
         return problems

@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS alerts (
     price INTEGER NOT NULL,
     market INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS subscribers (
+    chat_id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -141,6 +145,22 @@ class Store:
 
     def commit(self) -> None:
         self.conn.commit()
+
+    # ---------- подписчики ----------
+
+    def subscribe(self, chat_id: int) -> bool:
+        """True, если подписчик новый."""
+        with self.conn:
+            cur = self.conn.execute("INSERT OR IGNORE INTO subscribers(chat_id, ts) VALUES (?, ?)", (chat_id, time.time()))
+        return cur.rowcount > 0
+
+    def unsubscribe(self, chat_id: int) -> bool:
+        with self.conn:
+            cur = self.conn.execute("DELETE FROM subscribers WHERE chat_id=?", (chat_id,))
+        return cur.rowcount > 0
+
+    def subscribers(self) -> list[int]:
+        return [r["chat_id"] for r in self.conn.execute("SELECT chat_id FROM subscribers ORDER BY ts")]
 
     # ---------- сигналы ----------
 
