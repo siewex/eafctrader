@@ -8,7 +8,9 @@
 """
 import asyncio
 import logging
+import re
 import time
+import unicodedata
 from dataclasses import dataclass
 
 import aiohttp
@@ -26,10 +28,17 @@ POSITIONS = {
 }
 
 
+def slugify(text: str) -> str:
+    """Slug как в URL FUTNext: латиница без диакритики, через дефис (Bonmatí -> bonmati, Bruno Fernandes -> bruno-fernandes)."""
+    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "-", ascii_text).strip("-") or "player"
+
+
 @dataclass
 class PlayerInfo:
     id: int
     name: str
+    slug: str
     rating: int
     position: str
     rarity: str
@@ -51,7 +60,7 @@ class PlayerInfo:
 
     @property
     def page_url(self) -> str:
-        return f"https://www.futnext.com/players/{self.id}"
+        return f"https://www.futnext.com/players/{self.slug}/{self.id}"
 
 
 @dataclass
@@ -127,6 +136,7 @@ class FutnextClient:
         return PlayerInfo(
             id=int(raw["id"]),
             name=name,
+            slug=slugify(d.get("commonName") or d.get("lastName") or name),
             rating=int(raw.get("rating") or 0),
             position=POSITIONS.get(preferred.get("id"), "?"),
             rarity=(raw.get("rarity") or {}).get("name") or "",

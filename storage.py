@@ -3,12 +3,13 @@ import sqlite3
 import time
 from pathlib import Path
 
-from futnext import PlayerInfo
+from futnext import PlayerInfo, slugify
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS players (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
+    slug TEXT NOT NULL DEFAULT '',
     rating INTEGER NOT NULL,
     position TEXT NOT NULL,
     rarity TEXT NOT NULL,
@@ -46,7 +47,13 @@ class Store:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(players)")}
+        if "slug" not in cols:
+            self.conn.execute("ALTER TABLE players ADD COLUMN slug TEXT NOT NULL DEFAULT ''")
 
     # ---------- meta ----------
 
@@ -67,11 +74,11 @@ class Store:
         new_ids = {p.id for p in players}
         with self.conn:
             self.conn.executemany(
-                "INSERT INTO players(id, name, rating, position, rarity, club, nation, list_price, manual, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?) "
-                "ON CONFLICT(id) DO UPDATE SET name=excluded.name, rating=excluded.rating, position=excluded.position, "
+                "INSERT INTO players(id, name, slug, rating, position, rarity, club, nation, list_price, manual, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?) "
+                "ON CONFLICT(id) DO UPDATE SET name=excluded.name, slug=excluded.slug, rating=excluded.rating, position=excluded.position, "
                 "rarity=excluded.rarity, club=excluded.club, nation=excluded.nation, list_price=excluded.list_price, updated_at=excluded.updated_at",
-                [(p.id, p.name, p.rating, p.position, p.rarity, p.club, p.nation, p.price, now) for p in players],
+                [(p.id, p.name, p.slug, p.rating, p.position, p.rarity, p.club, p.nation, p.price, now) for p in players],
             )
             removed = old - new_ids
             if removed:
@@ -81,10 +88,10 @@ class Store:
     def upsert_manual(self, p: PlayerInfo) -> None:
         with self.conn:
             self.conn.execute(
-                "INSERT INTO players(id, name, rating, position, rarity, club, nation, list_price, manual, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?) "
-                "ON CONFLICT(id) DO UPDATE SET manual=1, name=excluded.name, rating=excluded.rating, list_price=excluded.list_price, updated_at=excluded.updated_at",
-                (p.id, p.name, p.rating, p.position, p.rarity, p.club, p.nation, p.price, time.time()),
+                "INSERT INTO players(id, name, slug, rating, position, rarity, club, nation, list_price, manual, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET manual=1, name=excluded.name, slug=excluded.slug, rating=excluded.rating, list_price=excluded.list_price, updated_at=excluded.updated_at",
+                (p.id, p.name, p.slug, p.rating, p.position, p.rarity, p.club, p.nation, p.price, time.time()),
             )
 
     def remove(self, player_id: int) -> bool:
@@ -110,9 +117,10 @@ class Store:
 
     @staticmethod
     def _row_to_player(r: sqlite3.Row) -> PlayerInfo:
+        # slug пуст у записей, созданных до миграции: берём фамилию (последнее слово имени) — сайт принимает любой slug
         return PlayerInfo(
-            id=r["id"], name=r["name"], rating=r["rating"], position=r["position"], rarity=r["rarity"],
-            club=r["club"], nation=r["nation"], price=r["list_price"],
+            id=r["id"], name=r["name"], slug=r["slug"] or slugify(r["name"].split()[-1]), rating=r["rating"],
+            position=r["position"], rarity=r["rarity"], club=r["club"], nation=r["nation"], price=r["list_price"],
         )
 
     # ---------- цены ----------
