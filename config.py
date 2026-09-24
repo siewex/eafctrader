@@ -56,6 +56,9 @@ class Settings:
     alert_cooldown_minutes: int = field(default_factory=lambda: _int("FUT_ALERT_COOLDOWN_MINUTES", 180))
     max_price_age_minutes: int = field(default_factory=lambda: _int("FUT_MAX_PRICE_AGE_MINUTES", 30))
 
+    tz_offset: float = field(default_factory=lambda: _float("FUT_TZ_OFFSET", 3))
+    tz_label: str = field(default_factory=lambda: _str("FUT_TZ_LABEL", "МСК"))
+
     poll_seconds: int = field(default_factory=lambda: _int("FUT_POLL_SECONDS", 120))
     concurrency: int = field(default_factory=lambda: max(1, min(_int("FUT_CONCURRENCY", 4), 8)))
     db_path: Path = field(default_factory=lambda: BASE_DIR / _str("DB_PATH", "market.db"))

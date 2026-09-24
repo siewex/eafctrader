@@ -1,9 +1,20 @@
 """Текст поста в Telegram (HTML)."""
 import html
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 
+from config import settings
 from detector import Signal
 from futnext import HistoryPoint, PlayerInfo
+
+
+def tz() -> timezone:
+    return timezone(timedelta(hours=settings.tz_offset))
+
+
+def fmt_time(ts: float, with_seconds: bool = True) -> str:
+    """Время в часовом поясе из настроек (по умолчанию МСК)."""
+    return datetime.fromtimestamp(ts, tz=tz()).strftime("%d.%m %H:%M:%S" if with_seconds else "%d.%m %H:%M")
 
 
 def coins(n: int | None) -> str:
@@ -20,23 +31,19 @@ def ago(minutes: float) -> str:
     return f"{h} ч {m} мин назад"
 
 
-def _utc(ts: float) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-
 def history_block(points: list[HistoryPoint], n: int = 10) -> str:
     if not points:
         return ""
-    lines = [f"{coins(p.cheapest or p.average):>10}  {_utc(p.ts)[:16]}" for p in reversed(points[-n:])]
-    return "Мин. цена по часам (UTC±0:00) ⏱\n<pre>" + "\n".join(lines) + "</pre>"
+    lines = [f"{coins(p.cheapest or p.average):>10}  {fmt_time(p.ts, with_seconds=False)}" for p in reversed(points[-n:])]
+    return f"Мин. цена по часам ({settings.tz_label}) ⏱\n<pre>" + "\n".join(lines) + "</pre>"
 
 
 def snapshots_block(snapshots: list[tuple[float, int]]) -> str:
     """Наши замеры минимального лота каждые пару минут — аналог «последних продаж» Futbin."""
     if len(snapshots) < 2:
         return ""
-    lines = [f"{coins(price):>10}  {_utc(ts)}" for ts, price in reversed(snapshots)]
-    return "Последние замеры мин. лота (UTC±0:00) ⏱\n<pre>" + "\n".join(lines) + "</pre>"
+    lines = [f"{coins(price):>10}  {fmt_time(ts)}" for ts, price in reversed(snapshots)]
+    return f"Последние замеры мин. лота ({settings.tz_label}) ⏱\n<pre>" + "\n".join(lines) + "</pre>"
 
 
 def format_signal(sig: Signal, platform: str) -> str:
@@ -55,7 +62,7 @@ def format_signal(sig: Signal, platform: str) -> str:
         f"<u>Профит:</u> <b>{coins(sig.profit)}</b> 📈 <i>(после налога 5%)</i>\n\n"
         f"<u>Изменение:</u> -{sig.drop_percent:.2f}% 🔻 <i>(к рыночной)</i>\n"
         f"<u>За последний час:</u> -{sig.fresh_percent:.1f}% <i>(было {coins(sig.recent_ref)})</i>\n"
-        f"<u>Обновлено:</u> {ago(sig.age_minutes)}\n\n"
+        f"<u>Обновлено:</u> {ago(sig.age_minutes)} <i>({fmt_time(time.time() - sig.age_minutes * 60, with_seconds=False)})</i>\n\n"
         f"<u>Рыночная цена:</u> {coins(sig.market)} 💰 <i>(медиана 24ч)</i>\n"
         f"{hour_avg}{single_lot}\n{blocks}"
     )

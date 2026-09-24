@@ -17,7 +17,7 @@ from aiogram.types import BotCommand, LinkPreviewOptions, Message
 
 from config import settings
 from detector import Detector, Signal
-from formatter import coins, format_price_card, format_signal
+from formatter import coins, fmt_time, format_price_card, format_signal
 from futnext import FutnextClient, FutnextError, PlayerInfo
 from storage import Store
 
@@ -233,7 +233,7 @@ async def cmd_status(message: Message) -> None:
     last = float(store.get_meta("watchlist_updated", "0") or 0)
     text = (
         f"Watchlist: <b>{store.count()}</b> карт (рейтинг {settings.min_rating}+, цена от {coins(settings.min_price)})\n"
-        f"Обновлён: {time.strftime('%d.%m %H:%M', time.localtime(last)) if last else 'ещё нет'}\n"
+        f"Обновлён: {fmt_time(last, with_seconds=False) + ' ' + settings.tz_label if last else 'ещё нет'}\n"
         f"Кругов опроса: {_stats['cycles']}, последний: {_stats['checked']} карт за {_stats['cycle_seconds']:.0f} с, "
         f"ошибок {_stats['errors']}, сигналов {_stats['signals']}\n"
         f"Постов за 24ч: {store.alerts_since(24)}\n"
