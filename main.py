@@ -31,6 +31,8 @@ client: FutnextClient
 detector: Detector
 bot: Bot
 
+WATCHLIST_HEADROOM = 1.5  # во сколько раз выше бюджета берём карты в watchlist (см. refresh_watchlist)
+
 _send_lock = asyncio.Lock()
 _stats = {"cycle_started": 0.0, "cycle_seconds": 0.0, "checked": 0, "errors": 0, "signals": 0, "alerts": 0, "cycles": 0}
 
@@ -160,10 +162,15 @@ async def poll_loop() -> None:
 async def refresh_watchlist() -> tuple[int, int, int]:
     """Пересобирает автоматический watchlist. Возвращает (всего, добавлено, удалено)."""
     players = await client.players_with_min_rating(settings.min_rating)
-    tradeable = [p for p in players if p.tradeable and (p.price or 0) >= settings.min_price]
+    # запас над бюджетом: карта, которая обычно стоит чуть дороже потолка, при обвале может в него попасть
+    ceiling = settings.max_price * WATCHLIST_HEADROOM if settings.max_price else 0
+    tradeable = [
+        p for p in players
+        if p.tradeable and (p.price or 0) >= settings.min_price and (not ceiling or p.price <= ceiling)
+    ]
     added, removed = store.replace_auto_watchlist(tradeable)
     store.set_meta("watchlist_updated", str(time.time()))
-    log.info("Watchlist обновлён: %d карт %d+ (торгуемых %d), +%d / -%d", len(players), settings.min_rating, len(tradeable), added, removed)
+    log.info("Watchlist обновлён: %d карт %d+ (в бюджете %d), +%d / -%d", len(players), settings.min_rating, len(tradeable), added, removed)
     return store.count(), added, removed
 
 
@@ -202,12 +209,16 @@ async def cmd_stop(message: Message) -> None:
 async def cmd_help(message: Message) -> None:
     text = (
         "Слежу за рынком EA FC (FUTNext, платформа <b>{plat}</b>) и присылаю карты, "
-        "чья текущая цена ниже рыночной на {drop:g}%+ с профитом от {profit} после налога.\n\n"
+        "чья текущая цена ниже рыночной на {drop:g}%+ с профитом от {profit} после налога.\n"
+        "Бюджет: до {budget} за карту.\n\n"
         "/start — подписаться на сигналы\n"
         "/stop — отписаться\n"
         "/price &lt;имя&gt; — текущая цена карты из watchlist\n"
         "/id — chat_id и user_id\n"
-    ).format(plat=settings.platform.upper(), drop=settings.drop_percent, profit=coins(settings.min_profit))
+    ).format(
+        plat=settings.platform.upper(), drop=settings.drop_percent, profit=coins(settings.min_profit),
+        budget=coins(settings.max_price) if settings.max_price else "без ограничений",
+    )
     if is_admin(message.from_user.id if message.from_user else None):
         text += (
             "\n<b>Админ:</b>\n"
@@ -232,7 +243,7 @@ async def cmd_status(message: Message) -> None:
         return
     last = float(store.get_meta("watchlist_updated", "0") or 0)
     text = (
-        f"Watchlist: <b>{store.count()}</b> карт (рейтинг {settings.min_rating}+, цена от {coins(settings.min_price)})\n"
+        f"Watchlist: <b>{store.count()}</b> карт (рейтинг {settings.min_rating}+, цена {coins(settings.min_price)}–{coins(settings.max_price) if settings.max_price else '∞'})\n"
         f"Обновлён: {fmt_time(last, with_seconds=False) + ' ' + settings.tz_label if last else 'ещё нет'}\n"
         f"Кругов опроса: {_stats['cycles']}, последний: {_stats['checked']} карт за {_stats['cycle_seconds']:.0f} с, "
         f"ошибок {_stats['errors']}, сигналов {_stats['signals']}\n"

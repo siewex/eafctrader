@@ -1,7 +1,7 @@
 """Логика сигнала.
 
 Условия (все сразу):
-  1. текущая минимальная цена (лот) свежая и не ниже FUT_MIN_PRICE;
+  1. текущая минимальная цена (лот) свежая и укладывается в бюджет FUT_MIN_PRICE..FUT_MAX_PRICE;
   2. она ниже рыночной (медиана минимальных цен за 24ч, без часов, когда карты не было в продаже) на FUT_DROP_PERCENT+;
   3. профит после налога EA 5% от рыночной >= FUT_MIN_PROFIT;
   4. спад свежий: цена ниже максимума за последний час (по нашим снимкам, на старте — по истории FUTNext) на FUT_FRESH_PERCENT+.
@@ -91,7 +91,10 @@ class Detector:
         return recent[-1].average if recent else None
 
     def price_usable(self, live: LivePrice) -> bool:
-        return live.price >= self.s.min_price and live.age_minutes <= self.s.max_price_age_minutes
+        """Цена в рамках бюджета и достаточно свежая, чтобы на неё вообще смотреть."""
+        if live.price < self.s.min_price or live.age_minutes > self.s.max_price_age_minutes:
+            return False
+        return not self.s.max_price or live.price <= self.s.max_price
 
     async def evaluate(self, player: PlayerInfo, live: LivePrice, recent_ref: int | None = None) -> Signal | None:
         """Signal, если условия выполнены, иначе None. Cooldown не учитывает — это should_alert().

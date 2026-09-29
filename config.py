@@ -46,6 +46,7 @@ class Settings:
     platform: str = field(default_factory=lambda: _str("FUT_PLATFORM", "pc").lower())
     min_rating: int = field(default_factory=lambda: _int("FUT_MIN_RATING", 84))
     min_price: int = field(default_factory=lambda: _int("FUT_MIN_PRICE", 5000))
+    max_price: int = field(default_factory=lambda: _int("FUT_MAX_PRICE", 200_000))
     watchlist_refresh_hours: float = field(default_factory=lambda: _float("FUT_WATCHLIST_REFRESH_HOURS", 12))
 
     drop_percent: float = field(default_factory=lambda: _float("FUT_DROP_PERCENT", 8))
@@ -69,6 +70,8 @@ class Settings:
             problems.append("BOT_TOKEN не задан")
         if self.platform not in {"pc", "ps"}:
             problems.append("FUT_PLATFORM должен быть pc или ps")
+        if self.max_price and self.max_price <= self.min_price:
+            problems.append("FUT_MAX_PRICE должен быть больше FUT_MIN_PRICE")
         return problems
 
 
