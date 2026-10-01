@@ -60,6 +60,7 @@ def platform_keyboard(current: str) -> InlineKeyboardMarkup:
 def active_platforms() -> list[str]:
     """Платформы, на которые кто-то подписан. Если подписчиков нет — платформа по умолчанию (для канала)."""
     used = {p for _, p in store.subscribers()}
+    used |= {store.platform_of(c) for c in permanent_chats()}
     if settings.channel_id:
         used.add(settings.platform)
     return sorted(used) or [settings.platform]
@@ -67,9 +68,32 @@ def active_platforms() -> list[str]:
 
 # ---------- отправка ----------
 
+async def notify_admins(text: str) -> None:
+    for admin_id in settings.admin_ids:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            log.debug("не удалось уведомить админа %s", admin_id)
+
+
+def permanent_chats() -> set[int]:
+    """Получатели из настроек: SUBSCRIBER_IDS и (по умолчанию) админы."""
+    chats = set(settings.subscriber_ids)
+    if settings.subscribe_admins:
+        chats |= settings.admin_ids
+    return chats
+
+
 def recipients(platform: str) -> list[int]:
-    """Подписчики этой платформы, плюс канал (он получает платформу по умолчанию)."""
+    """Подписчики этой платформы, постоянные получатели из настроек и канал.
+
+    Постоянные берутся из настроек, а не из базы: сигналы дойдут, даже если market.db
+    на хостинге сбросился или не записывается.
+    """
     chats = store.subscribers_for(platform)
+    for chat_id in sorted(permanent_chats()):
+        if chat_id not in chats and store.platform_of(chat_id) == platform:
+            chats.append(chat_id)
     if settings.channel_id and platform == settings.platform and settings.channel_id not in chats:
         chats.append(settings.channel_id)
     return chats
@@ -223,6 +247,13 @@ def chat_platform(message: Message) -> str:
 async def cmd_start(message: Message) -> None:
     new = store.subscribe(message.chat.id)
     platform = chat_platform(message)
+    log.info("/start от %s (%s): %s, всего подписчиков %d", message.chat.id, platform, "новый" if new else "уже был", len(store.subscribers()))
+    if new:
+        who = html.escape(message.from_user.full_name) if message.from_user else "чат"
+        await notify_admins(
+            f"➕ Новый подписчик: <code>{message.chat.id}</code> ({who}), платформа {platform.upper()}.\n"
+            f"Всего: {len(store.subscribers())}. Список для настроек — /subs"
+        )
     await message.answer(
         ("✅ Подписал. " if new else "Ты уже подписан. ")
         + "Буду присылать сюда карты, чья цена резко упала ниже рыночной.\n"
@@ -271,6 +302,59 @@ async def cb_platform(call: CallbackQuery) -> None:
     await call.message.answer(f"Платформа: <b>{PLATFORM_NAMES[choice]}</b>. Сигналы теперь по ценам этого рынка.")
 
 
+@router.message(Command("subs"))
+async def cmd_subs(message: Message) -> None:
+    """Список подписчиков и готовая строка SUBSCRIBER_IDS, чтобы восстановить их после сброса базы."""
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    subs = store.subscribers()
+    perm = permanent_chats()
+    if not subs and not perm:
+        await message.answer("Подписчиков нет.")
+        return
+    lines = [
+        f"<code>{chat_id}</code> — {PLATFORM_NAMES[platform]}" + (" · из настроек" if chat_id in perm else "")
+        for chat_id, platform in subs
+    ]
+    known = {c for c, _ in subs}
+    lines += [f"<code>{c}</code> — только в настройках" for c in sorted(perm) if c not in known]
+    everyone = ",".join(str(c) for c in sorted(known | perm))
+    await message.answer(
+        f"<b>Подписчики ({len(lines)}):</b>\n" + "\n".join(lines)
+        + "\n\nЧтобы подписки пережили сброс базы, впиши в настройки хостинга:\n"
+        f"<code>SUBSCRIBER_IDS={everyone}</code>"
+    )
+
+
+@router.message(Command("sub"))
+async def cmd_sub(message: Message) -> None:
+    """/sub <chat_id> [pc|ps] — подписать кого-то вручную."""
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Использование: /sub &lt;chat_id&gt; [pc|ps]")
+        return
+    chat_id = int(parts[1])
+    platform = parts[2].lower() if len(parts) > 2 and parts[2].lower() in PLATFORMS else settings.platform
+    store.set_platform(chat_id, platform)
+    await message.answer(f"Подписал <code>{chat_id}</code> ({PLATFORM_NAMES[platform]}). Всего: {len(store.subscribers())}")
+
+
+@router.message(Command("unsub"))
+async def cmd_unsub(message: Message) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Использование: /unsub &lt;chat_id&gt;")
+        return
+    chat_id = int(parts[1])
+    ok = store.unsubscribe(chat_id)
+    note = " Он есть в SUBSCRIBER_IDS и вернётся при перезапуске — убери его оттуда." if chat_id in permanent_chats() else ""
+    await message.answer(("Отписал." if ok else "Такого подписчика нет.") + note)
+
+
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     platform = chat_platform(message)
@@ -295,6 +379,9 @@ async def cmd_help(message: Message) -> None:
             "/watch &lt;id&gt; — добавить карту вручную (id из ссылки futnext.com/players/...)\n"
             "/unwatch &lt;id&gt; — убрать\n"
             "/test &lt;id&gt; — прислать пример поста сюда\n"
+            "/subs — кто подписан (+ строка для SUBSCRIBER_IDS)\n"
+            "/sub &lt;chat_id&gt; [pc|ps] — подписать вручную\n"
+            "/unsub &lt;chat_id&gt; — отписать\n"
         )
     await message.answer(text)
 
@@ -458,6 +545,23 @@ async def cmd_test(message: Message) -> None:
 
 # ---------- запуск ----------
 
+def check_db_persistence() -> None:
+    """Предупреждает, если база не переживает перезапуск: на некоторых хостингах файл затирается при деплое."""
+    try:
+        runs = int(store.get_meta("runs", "0") or 0) + 1
+        store.set_meta("runs", str(runs))
+    except Exception:
+        log.exception("База %s не пишется — подписки работать не будут, задай SUBSCRIBER_IDS", settings.db_path)
+        return
+    if runs == 1:
+        log.warning(
+            "База %s создана заново: подписки прошлого запуска потеряны. Если так после каждого деплоя — "
+            "задай SUBSCRIBER_IDS, тогда /start больше не понадобится", settings.db_path,
+        )
+    else:
+        log.info("База %s на месте (запуск №%d), подписки сохраняются", settings.db_path, runs)
+
+
 def restore_permanent_subscribers() -> None:
     """Подписывает чаты из SUBSCRIBER_IDS (и админов) — им не нужен /start, и подписка переживает сброс базы."""
     chats = set(settings.subscriber_ids)
@@ -477,6 +581,7 @@ async def main() -> None:
         sys.exit(1)
 
     store = Store(settings.db_path, settings.platform)
+    check_db_persistence()
     restore_permanent_subscribers()
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
