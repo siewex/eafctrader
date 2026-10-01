@@ -42,8 +42,11 @@ class Settings:
     bot_token: str = field(default_factory=lambda: _str("BOT_TOKEN"))
     channel_id: int = field(default_factory=lambda: _int("CHANNEL_ID", 0))
     admin_ids: set[int] = field(default_factory=lambda: _ids("ADMIN_IDS"))
+    # Постоянные получатели: им не нужно писать /start, и подписка не теряется при сбросе базы на хостинге
+    subscriber_ids: set[int] = field(default_factory=lambda: _ids("SUBSCRIBER_IDS"))
+    subscribe_admins: bool = field(default_factory=lambda: _str("SUBSCRIBE_ADMINS", "1") in {"1", "true", "yes"})
 
-    platform: str = field(default_factory=lambda: _str("FUT_PLATFORM", "pc").lower())
+    platform: str = field(default_factory=lambda: _str("FUT_PLATFORM", "pc").lower())  # платформа по умолчанию для новых подписчиков
     min_rating: int = field(default_factory=lambda: _int("FUT_MIN_RATING", 84))
     min_price: int = field(default_factory=lambda: _int("FUT_MIN_PRICE", 5000))
     max_price: int = field(default_factory=lambda: _int("FUT_MAX_PRICE", 200_000))
@@ -55,6 +58,7 @@ class Settings:
     single_lot_gap: float = field(default_factory=lambda: _float("FUT_SINGLE_LOT_GAP", 10))
     skip_single_lot: bool = field(default_factory=lambda: _str("FUT_SKIP_SINGLE_LOT", "0") in {"1", "true", "yes"})
     alert_cooldown_minutes: int = field(default_factory=lambda: _int("FUT_ALERT_COOLDOWN_MINUTES", 180))
+    warmup_cycles: int = field(default_factory=lambda: _int("FUT_WARMUP_CYCLES", 1))
     max_price_age_minutes: int = field(default_factory=lambda: _int("FUT_MAX_PRICE_AGE_MINUTES", 30))
 
     tz_offset: float = field(default_factory=lambda: _float("FUT_TZ_OFFSET", 3))

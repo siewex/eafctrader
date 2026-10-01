@@ -48,10 +48,13 @@ def valid_points(points: list[HistoryPoint]) -> list[HistoryPoint]:
 
 
 class Detector:
+    """Считает сигналы для одной платформы: у PC и PS разные рынки и разные цены."""
+
     def __init__(self, settings: Settings, store: Store, client: FutnextClient):
         self.s = settings
         self.store = store
         self.client = client
+        self.platform = client.platform
         self._history: dict[int, tuple[float, list[HistoryPoint]]] = {}  # player_id -> (fetched_at, points)
 
     async def history(self, player_id: int) -> list[HistoryPoint]:
@@ -76,7 +79,7 @@ class Detector:
 
     async def recent_reference(self, player_id: int, hours: float = 1) -> int | None:
         """Максимум цены за последний час: по нашим снимкам, а если их ещё нет — по последним точкам истории FUTNext."""
-        snaps = [price for _, price in self.store.recent_prices(player_id, hours)]
+        snaps = [price for _, price in self.store.recent_prices(player_id, self.platform, hours)]
         if snaps:
             return max(snaps)
         points = await self.history(player_id)
@@ -126,12 +129,12 @@ class Detector:
             player=player, price=live.price, market=market, profit=profit, drop_percent=drop,
             recent_ref=recent_ref, fresh_percent=fresh, age_minutes=live.age_minutes,
             hour_avg=hour_avg, single_lot=single_lot, history=points[-6:],
-            snapshots=self.store.last_prices(player.id, 8),
+            snapshots=self.store.last_prices(player.id, self.platform, 8),
         )
 
     def should_alert(self, sig: Signal) -> bool:
         """Антиспам: одна карта не чаще раза в cooldown, если только цена не упала ещё на 5%+ от прошлого сигнала."""
-        last = self.store.last_alert(sig.player.id)
+        last = self.store.last_alert(sig.player.id, self.platform)
         if not last:
             return True
         if time.time() - last["ts"] >= self.s.alert_cooldown_minutes * 60:

@@ -1,4 +1,7 @@
-"""FUT Market Bot: следит за ценами карт EA FC (ПК) на FUTNext и постит в Telegram резкие просадки с профитом.
+"""FUT Market Bot: следит за ценами карт EA FC на FUTNext и присылает в Telegram резкие просадки с профитом.
+
+Каждый подписчик выбирает свою платформу (PC или PS) командой /platform — это разные рынки с разными ценами,
+поэтому бот опрашивает каждую платформу, на которую кто-то подписан, отдельно.
 
 Запуск: python main.py (настройки в .env, см. .env.example)
 """
@@ -9,11 +12,11 @@ import os
 import sys
 import time
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BotCommand, LinkPreviewOptions, Message
+from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
 
 from config import settings
 from detector import Detector, Signal
@@ -25,28 +28,49 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(
 logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 log = logging.getLogger("fut-market")
 
-router = Router()
-store: Store
-client: FutnextClient
-detector: Detector
-bot: Bot
-
+PLATFORMS = ("pc", "ps")
+PLATFORM_NAMES = {"pc": "PC", "ps": "PlayStation / Xbox"}
 WATCHLIST_HEADROOM = 1.5  # во сколько раз выше бюджета берём карты в watchlist (см. refresh_watchlist)
 
+router = Router()
+store: Store
+clients: dict[str, FutnextClient] = {}
+detectors: dict[str, Detector] = {}
+bot: Bot
+
 _send_lock = asyncio.Lock()
-_stats = {"cycle_started": 0.0, "cycle_seconds": 0.0, "checked": 0, "errors": 0, "signals": 0, "alerts": 0, "cycles": 0}
+_stats: dict[str, dict] = {}
 
 
 def is_admin(user_id: int | None) -> bool:
     return user_id is not None and user_id in settings.admin_ids
 
 
+def stats_for(platform: str) -> dict:
+    return _stats.setdefault(platform, {"cycle_started": 0.0, "cycle_seconds": 0.0, "checked": 0, "errors": 0, "signals": 0, "alerts": 0, "cycles": 0})
+
+
+def platform_keyboard(current: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=("✅ " if current == p else "") + PLATFORM_NAMES[p], callback_data=f"platform:{p}")
+        for p in PLATFORMS
+    ]])
+
+
+def active_platforms() -> list[str]:
+    """Платформы, на которые кто-то подписан. Если подписчиков нет — платформа по умолчанию (для канала)."""
+    used = {p for _, p in store.subscribers()}
+    if settings.channel_id:
+        used.add(settings.platform)
+    return sorted(used) or [settings.platform]
+
+
 # ---------- отправка ----------
 
-def recipients() -> list[int]:
-    """Все, кто нажал /start, плюс канал из CHANNEL_ID, если задан."""
-    chats = store.subscribers()
-    if settings.channel_id and settings.channel_id not in chats:
+def recipients(platform: str) -> list[int]:
+    """Подписчики этой платформы, плюс канал (он получает платформу по умолчанию)."""
+    chats = store.subscribers_for(platform)
+    if settings.channel_id and platform == settings.platform and settings.channel_id not in chats:
         chats.append(settings.channel_id)
     return chats
 
@@ -63,7 +87,7 @@ async def send_to(chat_id: int, sig: Signal, text: str) -> bool:
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after + 1)
         except TelegramForbiddenError:  # пользователь заблокировал бота — убираем из подписчиков
-            if store.unsubscribe(chat_id):
+            if chat_id not in settings.subscriber_ids and store.unsubscribe(chat_id):
                 log.info("Подписчик %s заблокировал бота, удалён", chat_id)
             return False
         except Exception:
@@ -72,12 +96,11 @@ async def send_to(chat_id: int, sig: Signal, text: str) -> bool:
     return False
 
 
-async def send_alert(sig: Signal, only_to: int | None = None) -> int:
-    """Рассылает сигнал подписчикам (или одному чату). Возвращает число успешных отправок."""
-    text = format_signal(sig, settings.platform)
-    chats = [only_to] if only_to else recipients()
+async def send_alert(sig: Signal, platform: str, only_to: int | None = None) -> int:
+    """Рассылает сигнал подписчикам платформы (или одному чату). Возвращает число успешных отправок."""
+    text = format_signal(sig, platform)
+    chats = [only_to] if only_to else recipients(platform)
     if not chats:
-        log.warning("Некому слать: нет подписчиков (нужно написать боту /start) и CHANNEL_ID пуст")
         return 0
     sent = 0
     async with _send_lock:
@@ -91,112 +114,116 @@ async def send_alert(sig: Signal, only_to: int | None = None) -> int:
 
 # ---------- опрос ----------
 
-async def check_player(player: PlayerInfo) -> None:
+async def check_player(player: PlayerInfo, platform: str) -> None:
+    client, detector, stats = clients[platform], detectors[platform], stats_for(platform)
     try:
         live = await client.get_price(player.id)
     except FutnextError as e:
-        _stats["errors"] += 1
-        log.debug("цена %s: %s", player.id, e)
+        stats["errors"] += 1
+        log.debug("цена %s (%s): %s", player.id, platform, e)
         return
-    _stats["checked"] += 1
-    if not live:
-        return
-    if live.price <= 0:
+    stats["checked"] += 1
+    if not live or live.price <= 0:
         return
     if not detector.price_usable(live):
-        store.add_price(player.id, live.price, live.updated_at)
+        store.add_price(player.id, platform, live.price, live.updated_at)
         return
     # максимум за час считаем ДО записи текущего снимка, иначе он включит саму текущую цену
     try:
         recent_ref = await detector.recent_reference(player.id)
-    except FutnextError as e:
-        _stats["errors"] += 1
-        log.debug("история %s: %s", player.id, e)
-        return
-    store.add_price(player.id, live.price, live.updated_at)
-    try:
+        store.add_price(player.id, platform, live.price, live.updated_at)
         sig = await detector.evaluate(player, live, recent_ref)
     except FutnextError as e:
-        _stats["errors"] += 1
-        log.debug("история %s: %s", player.id, e)
+        stats["errors"] += 1
+        log.debug("история %s (%s): %s", player.id, platform, e)
         return
     if not sig:
         return
-    _stats["signals"] += 1
+    stats["signals"] += 1
+    if stats["cycles"] < settings.warmup_cycles:  # прогрев: копим свои замеры, чтобы не слать всё подряд после старта
+        return
     if not detector.should_alert(sig):
         return
-    log.info("СИГНАЛ %s: %s vs рынок %s, профит %s (-%.1f%%)", player.title, sig.price, sig.market, sig.profit, sig.drop_percent)
-    if await send_alert(sig) > 0:
-        store.record_alert(player.id, sig.price, sig.market)
-        _stats["alerts"] += 1
+    log.info("СИГНАЛ [%s] %s: %s vs рынок %s, профит %s (-%.1f%%)", platform, player.title, sig.price, sig.market, sig.profit, sig.drop_percent)
+    if await send_alert(sig, platform) > 0:
+        store.record_alert(player.id, platform, sig.price, sig.market)
+        stats["alerts"] += 1
 
 
-async def poll_cycle() -> None:
-    players = store.all_players()
+async def poll_platform(platform: str) -> None:
+    players = store.all_players(platform)
     if not players:
-        log.warning("Watchlist пуст — жду обновления")
+        log.warning("Watchlist [%s] пуст — жду обновления", platform)
         return
-    _stats.update(cycle_started=time.time(), checked=0, errors=0, signals=0, alerts=0)
-    await asyncio.gather(*(check_player(p) for p in players))
+    stats = stats_for(platform)
+    stats.update(cycle_started=time.time(), checked=0, errors=0, signals=0, alerts=0)
+    await asyncio.gather(*(check_player(p, platform) for p in players))
     store.commit()
-    _stats["cycle_seconds"] = time.time() - _stats["cycle_started"]
-    _stats["cycles"] += 1
+    stats["cycle_seconds"] = time.time() - stats["cycle_started"]
+    stats["cycles"] += 1
+    warmup = " (прогрев, не отправляю)" if stats["cycles"] <= settings.warmup_cycles else ""
     log.info(
-        "Круг %d: %d карт за %.0f с, ошибок %d, сигналов %d, отправлено %d",
-        _stats["cycles"], _stats["checked"], _stats["cycle_seconds"], _stats["errors"], _stats["signals"], _stats["alerts"],
+        "Круг [%s] %d: %d карт за %.0f с, ошибок %d, сигналов %d, отправлено %d%s",
+        platform, stats["cycles"], stats["checked"], stats["cycle_seconds"], stats["errors"], stats["signals"], stats["alerts"], warmup,
     )
-    if _stats["cycles"] % 20 == 0:
+    if stats["cycles"] % 20 == 0:
         store.prune_prices()
 
 
 async def poll_loop() -> None:
     while True:
+        started = time.time()
         try:
-            await poll_cycle()
+            for platform in active_platforms():
+                await poll_platform(platform)
         except Exception:
             log.exception("Ошибка в круге опроса")
-        elapsed = time.time() - _stats["cycle_started"] if _stats["cycle_started"] else 0
-        await asyncio.sleep(max(10, settings.poll_seconds - elapsed))
+        await asyncio.sleep(max(10, settings.poll_seconds - (time.time() - started)))
 
 
-async def refresh_watchlist() -> tuple[int, int, int]:
-    """Пересобирает автоматический watchlist. Возвращает (всего, добавлено, удалено)."""
-    players = await client.players_with_min_rating(settings.min_rating)
+async def refresh_watchlist(platform: str) -> tuple[int, int, int]:
+    """Пересобирает автоматический watchlist платформы. Возвращает (всего, добавлено, удалено)."""
+    players = await clients[platform].players_with_min_rating(settings.min_rating)
     # запас над бюджетом: карта, которая обычно стоит чуть дороже потолка, при обвале может в него попасть
     ceiling = settings.max_price * WATCHLIST_HEADROOM if settings.max_price else 0
     tradeable = [
         p for p in players
         if p.tradeable and (p.price or 0) >= settings.min_price and (not ceiling or p.price <= ceiling)
     ]
-    added, removed = store.replace_auto_watchlist(tradeable)
-    store.set_meta("watchlist_updated", str(time.time()))
-    log.info("Watchlist обновлён: %d карт %d+ (в бюджете %d), +%d / -%d", len(players), settings.min_rating, len(tradeable), added, removed)
-    return store.count(), added, removed
+    added, removed = store.replace_auto_watchlist(tradeable, platform)
+    store.set_meta(f"watchlist_updated:{platform}", str(time.time()))
+    log.info("Watchlist [%s] обновлён: %d карт %d+ (в бюджете %d), +%d / -%d", platform, len(players), settings.min_rating, len(tradeable), added, removed)
+    return store.count(platform), added, removed
 
 
 async def watchlist_loop() -> None:
     while True:
-        last = float(store.get_meta("watchlist_updated", "0") or 0)
-        due = time.time() - last >= settings.watchlist_refresh_hours * 3600 or store.count() == 0
-        if due:
-            try:
-                await refresh_watchlist()
-            except Exception:
-                log.exception("Не удалось обновить watchlist")
-                await asyncio.sleep(600)
-                continue
+        for platform in active_platforms():
+            last = float(store.get_meta(f"watchlist_updated:{platform}", "0") or 0)
+            if time.time() - last >= settings.watchlist_refresh_hours * 3600 or store.count(platform) == 0:
+                try:
+                    await refresh_watchlist(platform)
+                except Exception:
+                    log.exception("Не удалось обновить watchlist [%s]", platform)
         await asyncio.sleep(600)
 
 
 # ---------- команды ----------
 
+def chat_platform(message: Message) -> str:
+    return store.platform_of(message.chat.id)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     new = store.subscribe(message.chat.id)
+    platform = chat_platform(message)
     await message.answer(
         ("✅ Подписал. " if new else "Ты уже подписан. ")
-        + f"Буду присылать сюда карты, чья цена резко упала ниже рыночной (платформа <b>{settings.platform.upper()}</b>). "
-        "Отписаться — /stop, справка — /help"
+        + "Буду присылать сюда карты, чья цена резко упала ниже рыночной.\n"
+        f"Платформа: <b>{PLATFORM_NAMES[platform]}</b> — поменять можно кнопкой ниже или командой /platform.\n"
+        "Отписаться — /stop, справка — /help",
+        reply_markup=platform_keyboard(platform),
     )
 
 
@@ -205,18 +232,54 @@ async def cmd_stop(message: Message) -> None:
     await message.answer("Отписал. Вернуться — /start" if store.unsubscribe(message.chat.id) else "Ты и не был подписан. Подписаться — /start")
 
 
+@router.message(Command("platform"))
+async def cmd_platform(message: Message) -> None:
+    """Переключение платформы: /platform ps или кнопками."""
+    arg = (message.text or "").split(maxsplit=1)
+    choice = arg[1].strip().lower() if len(arg) > 1 else ""
+    if choice in {"ps", "playstation", "xbox", "console", "консоль", "пс"}:
+        choice = "ps"
+    elif choice in {"pc", "пк"}:
+        choice = "pc"
+    else:
+        choice = ""
+    if choice:
+        store.set_platform(message.chat.id, choice)
+        await message.answer(f"Платформа: <b>{PLATFORM_NAMES[choice]}</b>. Сигналы теперь по ценам этого рынка.", reply_markup=platform_keyboard(choice))
+        return
+    current = chat_platform(message)
+    await message.answer(f"Сейчас: <b>{PLATFORM_NAMES[current]}</b>. Выбери платформу:", reply_markup=platform_keyboard(current))
+
+
+@router.callback_query(F.data.startswith("platform:"))
+async def cb_platform(call: CallbackQuery) -> None:
+    choice = call.data.split(":", 1)[1]
+    if choice not in PLATFORMS or not call.message:
+        await call.answer()
+        return
+    store.set_platform(call.message.chat.id, choice)
+    await call.answer(f"Платформа: {PLATFORM_NAMES[choice]}")
+    try:
+        await call.message.edit_reply_markup(reply_markup=platform_keyboard(choice))
+    except TelegramBadRequest:
+        pass
+    await call.message.answer(f"Платформа: <b>{PLATFORM_NAMES[choice]}</b>. Сигналы теперь по ценам этого рынка.")
+
+
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
+    platform = chat_platform(message)
     text = (
-        "Слежу за рынком EA FC (FUTNext, платформа <b>{plat}</b>) и присылаю карты, "
+        "Слежу за рынком EA FC (FUTNext) и присылаю карты, "
         "чья текущая цена ниже рыночной на {drop:g}%+ с профитом от {profit} после налога.\n"
-        "Бюджет: до {budget} за карту.\n\n"
+        "Твоя платформа: <b>{plat}</b>. Бюджет: до {budget} за карту.\n\n"
+        "/platform — переключить PC / PlayStation\n"
         "/start — подписаться на сигналы\n"
         "/stop — отписаться\n"
         "/price &lt;имя&gt; — текущая цена карты из watchlist\n"
         "/id — chat_id и user_id\n"
     ).format(
-        plat=settings.platform.upper(), drop=settings.drop_percent, profit=coins(settings.min_profit),
+        plat=PLATFORM_NAMES[platform], drop=settings.drop_percent, profit=coins(settings.min_profit),
         budget=coins(settings.max_price) if settings.max_price else "без ограничений",
     )
     if is_admin(message.from_user.id if message.from_user else None):
@@ -241,18 +304,26 @@ async def cmd_id(message: Message) -> None:
 async def cmd_status(message: Message) -> None:
     if not is_admin(message.from_user.id if message.from_user else None):
         return
-    last = float(store.get_meta("watchlist_updated", "0") or 0)
-    text = (
-        f"Watchlist: <b>{store.count()}</b> карт (рейтинг {settings.min_rating}+, цена {coins(settings.min_price)}–{coins(settings.max_price) if settings.max_price else '∞'})\n"
-        f"Обновлён: {fmt_time(last, with_seconds=False) + ' ' + settings.tz_label if last else 'ещё нет'}\n"
-        f"Кругов опроса: {_stats['cycles']}, последний: {_stats['checked']} карт за {_stats['cycle_seconds']:.0f} с, "
-        f"ошибок {_stats['errors']}, сигналов {_stats['signals']}\n"
+    lines = []
+    for platform in active_platforms():
+        last = float(store.get_meta(f"watchlist_updated:{platform}", "0") or 0)
+        st = stats_for(platform)
+        lines.append(
+            f"<b>{PLATFORM_NAMES[platform]}</b>: {store.count(platform)} карт, "
+            f"обновлён {fmt_time(last, with_seconds=False) + ' ' + settings.tz_label if last else 'ещё нет'}\n"
+            f"  кругов {st['cycles']}, последний: {st['checked']} карт за {st['cycle_seconds']:.0f} с, "
+            f"ошибок {st['errors']}, сигналов {st['signals']}\n"
+            f"  подписчиков: {len(store.subscribers_for(platform))}"
+        )
+    subs = store.subscribers()
+    await message.answer(
+        "\n".join(lines) + "\n\n"
+        f"Всего подписчиков: {len(subs)}" + (f", канал {settings.channel_id}" if settings.channel_id else "") + "\n"
         f"Постов за 24ч: {store.alerts_since(24)}\n"
-        f"Подписчиков: {len(store.subscribers())}" + (f", канал {settings.channel_id}" if settings.channel_id else "") + "\n"
+        f"Фильтры: рейтинг {settings.min_rating}+, цена {coins(settings.min_price)}–{coins(settings.max_price) if settings.max_price else '∞'}\n"
         f"Условия: просадка ≥{settings.drop_percent:g}% к рынку и ≥{settings.fresh_percent:g}% за час, профит ≥{coins(settings.min_profit)}, "
-        f"cooldown {settings.alert_cooldown_minutes} мин, опрос каждые {settings.poll_seconds} с"
+        f"cooldown {settings.alert_cooldown_minutes} мин, опрос каждые {settings.poll_seconds} с, прогрев {settings.warmup_cycles} кругов"
     )
-    await message.answer(text)
 
 
 @router.message(Command("refresh"))
@@ -260,12 +331,14 @@ async def cmd_refresh(message: Message) -> None:
     if not is_admin(message.from_user.id if message.from_user else None):
         return
     await message.answer("Собираю watchlist с FUTNext…")
-    try:
-        total, added, removed = await refresh_watchlist()
-    except Exception as e:
-        await message.answer(f"Ошибка: {html.escape(str(e))}")
-        return
-    await message.answer(f"Готово: {total} карт (+{added} / -{removed})")
+    out = []
+    for platform in active_platforms():
+        try:
+            total, added, removed = await refresh_watchlist(platform)
+            out.append(f"{PLATFORM_NAMES[platform]}: {total} карт (+{added} / -{removed})")
+        except Exception as e:
+            out.append(f"{PLATFORM_NAMES[platform]}: ошибка {html.escape(str(e))}")
+    await message.answer("\n".join(out))
 
 
 def _arg_id(message: Message) -> int | None:
@@ -284,16 +357,17 @@ async def cmd_watch(message: Message) -> None:
     if not pid:
         await message.answer("Использование: /watch <id или ссылка futnext.com/players/…/id>")
         return
+    platform = chat_platform(message)
     try:
-        p = await client.get_player(pid)
+        p = await clients[platform].get_player(pid)
     except FutnextError as e:
         await message.answer(f"FUTNext не ответил: {html.escape(str(e))}")
         return
     if not p:
         await message.answer("Карта не найдена")
         return
-    store.upsert_manual(p)
-    await message.answer(f"Добавил: {html.escape(p.title)}")
+    store.upsert_manual(p, platform)
+    await message.answer(f"Добавил ({PLATFORM_NAMES[platform]}): {html.escape(p.title)}")
 
 
 @router.message(Command("unwatch"))
@@ -304,7 +378,7 @@ async def cmd_unwatch(message: Message) -> None:
     if not pid:
         await message.answer("Использование: /unwatch <id>")
         return
-    await message.answer("Убрал" if store.remove(pid) else "Такой карты в watchlist нет")
+    await message.answer("Убрал" if store.remove(pid, chat_platform(message)) else "Такой карты в watchlist нет")
 
 
 @router.message(Command("price"))
@@ -313,10 +387,12 @@ async def cmd_price(message: Message) -> None:
     if len(parts) < 2:
         await message.answer("Использование: /price <имя игрока>")
         return
-    matches = store.search(parts[1], limit=3)
+    platform = chat_platform(message)
+    matches = store.search(parts[1], platform, limit=3)
     if not matches:
         await message.answer("В watchlist таких нет. Админ может добавить через /watch <id>")
         return
+    client, detector = clients[platform], detectors[platform]
     blocks = []
     for p in matches:
         try:
@@ -327,24 +403,29 @@ async def cmd_price(message: Message) -> None:
             continue
         blocks.append(format_price_card(
             p, live.price if live else None, live.age_minutes if live else None,
-            detector.market_price(points), points, store.last_prices(p.id, 10),
+            detector.market_price(points), points, store.last_prices(p.id, platform, 10),
         ))
-    await message.answer("\n\n".join(blocks), link_preview_options=LinkPreviewOptions(is_disabled=True))
+    await message.answer(
+        f"<b>{PLATFORM_NAMES[platform]}</b>\n\n" + "\n\n".join(blocks),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
 
 
 @router.message(Command("test"))
 async def cmd_test(message: Message) -> None:
     if not is_admin(message.from_user.id if message.from_user else None):
         return
+    platform = chat_platform(message)
+    client, detector = clients[platform], detectors[platform]
     pid = _arg_id(message)
-    p = store.get_player(pid) if pid else None
+    p = store.get_player(pid, platform) if pid else None
     if pid and not p:
         try:
             p = await client.get_player(pid)
         except FutnextError:
             p = None
     if not p:
-        players = store.all_players()
+        players = store.all_players(platform)
         p = players[0] if players else None
     if not p:
         await message.answer("Нет карт для примера — сначала /refresh или укажи id")
@@ -359,42 +440,57 @@ async def cmd_test(message: Message) -> None:
         drop_percent=max(0.0, (market - price) / market * 100), recent_ref=recent_ref,
         fresh_percent=max(0.0, (recent_ref - price) / recent_ref * 100),
         age_minutes=live.age_minutes if live else 0, hour_avg=detector.hour_average(points),
-        single_lot=False, history=points[-6:], snapshots=store.last_prices(p.id, 10),
+        single_lot=False, history=points[-6:], snapshots=store.last_prices(p.id, platform, 10),
     )
-    if not await send_alert(sig, only_to=message.chat.id):
+    if not await send_alert(sig, platform, only_to=message.chat.id):
         await message.answer("Не получилось отправить пример — смотри логи")
 
 
 # ---------- запуск ----------
 
+def restore_permanent_subscribers() -> None:
+    """Подписывает чаты из SUBSCRIBER_IDS (и админов) — им не нужен /start, и подписка переживает сброс базы."""
+    chats = set(settings.subscriber_ids)
+    if settings.subscribe_admins:
+        chats |= settings.admin_ids
+    restored = [c for c in chats if store.subscribe(c)]
+    if restored:
+        log.info("Постоянные подписчики восстановлены: %s", ", ".join(map(str, restored)))
+
+
 async def main() -> None:
-    global store, client, detector, bot
+    global store, bot
     problems = settings.validate()
     if problems:
         for p in problems:
             log.error(p)
         sys.exit(1)
 
-    store = Store(settings.db_path)
+    store = Store(settings.db_path, settings.platform)
+    restore_permanent_subscribers()
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
 
-    async with FutnextClient(settings.platform, settings.concurrency) as c:
-        client = c
-        detector = Detector(settings, store, client)
+    async with FutnextClient("pc", settings.concurrency) as pc, FutnextClient("ps", settings.concurrency) as ps:
+        clients.update(pc=pc, ps=ps)
+        for name, c in clients.items():
+            detectors[name] = Detector(settings, store, c)
         me = await bot.get_me()
         await bot.set_my_commands([
             BotCommand(command="start", description="Подписаться на сигналы"),
-            BotCommand(command="stop", description="Отписаться"),
+            BotCommand(command="platform", description="Переключить PC / PlayStation"),
             BotCommand(command="price", description="Текущая цена карты"),
-            BotCommand(command="status", description="Состояние бота (админ)"),
+            BotCommand(command="stop", description="Отписаться"),
             BotCommand(command="help", description="Справка"),
         ])
-        log.info("Бот @%s запущен, платформа %s, подписчиков %d, канал %s", me.username, settings.platform, len(store.subscribers()), settings.channel_id or "-")
+        log.info(
+            "Бот @%s запущен, подписчиков %d, активные платформы: %s, канал %s",
+            me.username, len(store.subscribers()), ", ".join(active_platforms()), settings.channel_id or "-",
+        )
         tasks = [asyncio.create_task(watchlist_loop()), asyncio.create_task(poll_loop())]
         try:
-            await dp.start_polling(bot, allowed_updates=["message"])
+            await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
         finally:
             for t in tasks:
                 t.cancel()
