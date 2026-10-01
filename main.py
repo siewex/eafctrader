@@ -318,7 +318,10 @@ async def cmd_subs(message: Message) -> None:
     ]
     known = {c for c, _ in subs}
     lines += [f"<code>{c}</code> — только в настройках" for c in sorted(perm) if c not in known]
-    everyone = ",".join(str(c) for c in sorted(known | perm))
+    plat_of = {c: p for c, p in subs}
+    everyone = ",".join(
+        f"{c}:{plat_of.get(c, settings.platform)}" for c in sorted(known | perm)
+    )
     await message.answer(
         f"<b>Подписчики ({len(lines)}):</b>\n" + "\n".join(lines)
         + "\n\nЧтобы подписки пережили сброс базы, впиши в настройки хостинга:\n"
@@ -567,9 +570,20 @@ def restore_permanent_subscribers() -> None:
     chats = set(settings.subscriber_ids)
     if settings.subscribe_admins:
         chats |= settings.admin_ids
-    restored = [c for c in chats if store.subscribe(c)]
+    restored, pinned = [], []
+    for chat_id in sorted(chats):
+        platform = settings.subscriber_platforms.get(chat_id, "")
+        if platform:
+            # платформа закреплена в настройках: восстанавливаем её и после сброса базы
+            if store.platform_of(chat_id) != platform or store.subscribe(chat_id, platform):
+                store.set_platform(chat_id, platform)
+                pinned.append(f"{chat_id}:{platform}")
+        elif store.subscribe(chat_id):
+            restored.append(str(chat_id))
     if restored:
-        log.info("Постоянные подписчики восстановлены: %s", ", ".join(map(str, restored)))
+        log.info("Постоянные подписчики восстановлены: %s", ", ".join(restored))
+    if pinned:
+        log.info("Платформа закреплена из настроек: %s", ", ".join(pinned))
 
 
 async def main() -> None:

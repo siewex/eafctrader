@@ -33,6 +33,23 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+def _id_platforms(name: str) -> dict[int, str]:
+    """Разбирает SUBSCRIBER_IDS вида "12345:ps, 777" -> {12345: "ps", 777: ""}.
+
+    Платформа после двоеточия закрепляет выбор: он не потеряется, даже если база сбросится.
+    """
+    out: dict[int, str] = {}
+    for item in _str(name).replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        chat, _, platform = item.partition(":")
+        chat = chat.strip()
+        if chat.lstrip("-").isdigit():
+            out[int(chat)] = platform.strip().lower() if platform.strip().lower() in {"pc", "ps"} else ""
+    return out
+
+
 def _ids(name: str) -> set[int]:
     return {int(x) for x in _str(name).replace(";", ",").split(",") if x.strip().lstrip("-").isdigit()}
 
@@ -43,7 +60,8 @@ class Settings:
     channel_id: int = field(default_factory=lambda: _int("CHANNEL_ID", 0))
     admin_ids: set[int] = field(default_factory=lambda: _ids("ADMIN_IDS"))
     # Постоянные получатели: им не нужно писать /start, и подписка не теряется при сбросе базы на хостинге
-    subscriber_ids: set[int] = field(default_factory=lambda: _ids("SUBSCRIBER_IDS"))
+    # {chat_id: "pc"/"ps"/""} — пустая строка значит "платформа по умолчанию или выбранная через /platform"
+    subscriber_platforms: dict[int, str] = field(default_factory=lambda: _id_platforms("SUBSCRIBER_IDS"))
     subscribe_admins: bool = field(default_factory=lambda: _str("SUBSCRIBE_ADMINS", "1") in {"1", "true", "yes"})
 
     platform: str = field(default_factory=lambda: _str("FUT_PLATFORM", "pc").lower())  # платформа по умолчанию для новых подписчиков
@@ -67,6 +85,10 @@ class Settings:
     poll_seconds: int = field(default_factory=lambda: _int("FUT_POLL_SECONDS", 120))
     concurrency: int = field(default_factory=lambda: max(1, min(_int("FUT_CONCURRENCY", 4), 8)))
     db_path: Path = field(default_factory=lambda: BASE_DIR / _str("DB_PATH", "market.db"))
+
+    @property
+    def subscriber_ids(self) -> set[int]:
+        return set(self.subscriber_platforms)
 
     def validate(self) -> list[str]:
         problems = []
