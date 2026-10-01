@@ -101,6 +101,10 @@ async def send_alert(sig: Signal, platform: str, only_to: int | None = None) -> 
     text = format_signal(sig, platform)
     chats = [only_to] if only_to else recipients(platform)
     if not chats:
+        log.warning(
+            "[%s] СИГНАЛ %s некому отправить: подписчиков нет. Напиши боту /start или задай SUBSCRIBER_IDS",
+            platform, sig.player.title,
+        )
         return 0
     sent = 0
     async with _send_lock:
@@ -147,6 +151,7 @@ async def check_player(player: PlayerInfo, platform: str) -> None:
     log.info("СИГНАЛ [%s] %s: %s vs рынок %s, профит %s (-%.1f%%)", platform, player.title, sig.price, sig.market, sig.profit, sig.drop_percent)
     if await send_alert(sig, platform) > 0:
         store.record_alert(player.id, platform, sig.price, sig.market)
+        store.set_meta("last_sent", str(time.time()))
         stats["alerts"] += 1
 
 
@@ -316,9 +321,14 @@ async def cmd_status(message: Message) -> None:
             f"  подписчиков: {len(store.subscribers_for(platform))}"
         )
     subs = store.subscribers()
+    last_sent = float(store.get_meta("last_sent", "0") or 0)
+    warming = [p for p in active_platforms() if stats_for(p)["cycles"] < settings.warmup_cycles]
     await message.answer(
         "\n".join(lines) + "\n\n"
-        f"Всего подписчиков: {len(subs)}" + (f", канал {settings.channel_id}" if settings.channel_id else "") + "\n"
+        + ("⚠️ <b>Подписчиков нет</b> — сигналы никому не уйдут, напиши /start\n" if not subs and not settings.channel_id else "")
+        + ("⏳ Идёт прогрев (" + ", ".join(warming) + ") — сигналы пока не отправляются\n" if warming else "")
+        + f"Всего подписчиков: {len(subs)}" + (f", канал {settings.channel_id}" if settings.channel_id else "") + "\n"
+        f"Последний отправленный сигнал: {fmt_time(last_sent, with_seconds=False) + ' ' + settings.tz_label if last_sent else 'ещё не было'}\n"
         f"Постов за 24ч: {store.alerts_since(24)}\n"
         f"Фильтры: рейтинг {settings.min_rating}+, цена {coins(settings.min_price)}–{coins(settings.max_price) if settings.max_price else '∞'}\n"
         f"Условия: просадка ≥{settings.drop_percent:g}% к рынку и ≥{settings.fresh_percent:g}% за час, профит ≥{coins(settings.min_profit)}, "
@@ -488,6 +498,10 @@ async def main() -> None:
             "Бот @%s запущен, подписчиков %d, активные платформы: %s, канал %s",
             me.username, len(store.subscribers()), ", ".join(active_platforms()), settings.channel_id or "-",
         )
+        if not store.subscribers() and not settings.channel_id:
+            log.warning("Подписчиков нет — сигналы никому не уйдут. Напиши боту /start или задай SUBSCRIBER_IDS")
+        if settings.warmup_cycles:
+            log.info("Прогрев: первые %d круг(а) сигналы не отправляются (FUT_WARMUP_CYCLES)", settings.warmup_cycles)
         tasks = [asyncio.create_task(watchlist_loop()), asyncio.create_task(poll_loop())]
         try:
             await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
